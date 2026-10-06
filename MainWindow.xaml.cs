@@ -19,9 +19,16 @@ namespace WpfApp1
         public MainWindow()
         {
             InitializeComponent();
+            tbHello.Text = "Hello, World! 2";
+            btnClick.Content = "Click Me 2";
         }
 
         private void CheckBox_Checked(object sender, RoutedEventArgs e)
+        {
+
+        }
+
+        private void btnClick_Click(object sender, RoutedEventArgs e)
         {
 
         }

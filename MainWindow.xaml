@@ -6,13 +6,14 @@
         xmlns:local="clr-namespace:WpfApp1"
         mc:Ignorable="d"
         Title="MainWindow" Height="450" Width="800">
-    <Grid Margin="0,0,-2,3" >
+    <Grid Margin="0,0,0,4" >
         <Grid.ColumnDefinitions>
             <ColumnDefinition Width="199*"/>
             <ColumnDefinition/>
         </Grid.ColumnDefinitions>
         
-        <TextBlock Text="Hello" HorizontalAlignment="Center" VerticalAlignment="Center" FontSize="70"/>
+        <TextBlock Name="tbHello"  Text="hiii" FontSize="70"/>
+        <Button Name="btnClick" Content="Run" HorizontalAlignment="Center" VerticalAlignment="Center" FontSize="30" Click="btnClick_Click"/>
 
     </Grid>
 </Window>
