@@ -1,84 +1,145 @@
+```python
 import clr
+import os
 
-from Autodesk.Revit.DB import *
+from pyrevit import revit, forms
+from Autodesk.Revit.DB import (
+    Transaction,
+    Family,
+    FamilySymbol,
+    FilteredElementCollector,
+    XYZ,
+    ElementId
+)
 from Autodesk.Revit.DB.Structure import StructuralType
-from Autodesk.Revit.UI import TaskDialog
+from Autodesk.Revit.Exceptions import OperationCanceledException
+from System.Collections.Generic import List
 
-# Get the active Revit document
-uidoc = __revit__.ActiveUIDocument
-doc = uidoc.Document
+doc = revit.doc
+uidoc = revit.uidoc
 
-# Path to the Revit family
-family_path = r"C:\Families\Chair.rfa"
 
-# Load and place the family
-try:
-    family_ref = clr.Reference[Family]()
+def load_and_place_family():
+    # 1. Choose a family file
+    family_path = forms.pick_file(
+        file_ext="rfa",
+        title="Select Family to Load and Place"
+    )
 
-    with Transaction(doc, "Load and Place Family") as t:
-        t.Start()
+    if not family_path:
+        forms.alert("No family file selected.")
+        return
 
-        # 1. Load the family into the project
-        loaded = doc.LoadFamily(family_path, family_ref)
+    family = None
 
-        if loaded:
-            family = family_ref.Value
-        else:
-            # Family may already exist in the project
-            family = None
-            for f in FilteredElementCollector(doc).OfClass(Family):
-                if f.Name == family_path.split("\\")[-1].replace(".rfa", ""):
-                    family = f
+    try:
+        # 2. Load the family or retrieve it if already loaded
+        family_ref = clr.Reference[Family]()
+
+        with Transaction(doc, "Load Family") as t:
+            t.Start()
+
+            loaded = doc.LoadFamily(family_path, family_ref)
+
+            if loaded:
+                family = family_ref.Value
+
+            t.Commit()
+
+        # If already loaded, retrieve it from the project
+        if family is None:
+            expected_name = os.path.splitext(
+                os.path.basename(family_path)
+            )[0]
+
+            for item in FilteredElementCollector(doc).OfClass(Family):
+                if item.Name == expected_name:
+                    family = item
                     break
 
         if family is None:
-            raise Exception("Could not load or find the family.")
+            raise Exception(
+                "Could not load or find the selected family."
+            )
 
-        # 2. Get the first available family type
-        symbol = None
-        for symbol_id in family.GetFamilySymbolIds():
-            symbol = doc.GetElement(symbol_id)
-            break
+        # 3. Get the available family types
+        symbol_ids = list(family.GetFamilySymbolIds())
 
-        if symbol is None:
+        if not symbol_ids:
             raise Exception("No family types found.")
 
-        # 3. Activate the family type
-        if not symbol.IsActive:
-            symbol.Activate()
-            doc.Regenerate()
+        symbols = [
+            doc.GetElement(symbol_id)
+            for symbol_id in symbol_ids
+        ]
 
-        # 4. Find a level in the project
-        level = FilteredElementCollector(doc) \
-            .OfClass(Level) \
-            .FirstElement()
+        # 4. Let the user choose a family type
+        symbol_names = [
+            "{}".format(symbol.Name)
+            for symbol in symbols
+        ]
 
-        if level is None:
-            raise Exception("No level found in the project.")
-
-        # 5. Place the family in the model
-        point = XYZ(0, 0, 0)
-
-        instance = doc.Create.NewFamilyInstance(
-            point,
-            symbol,
-            level,
-            StructuralType.NonStructural
+        selected_name = forms.SelectFromList.show(
+            symbol_names,
+            title="Choose Family Type",
+            button_name="Select Type"
         )
 
-        t.Commit()
+        if not selected_name:
+            forms.alert("No family type selected.")
+            return
 
-    # 6. Select the placed family
-    uidoc.Selection.SetElementIds(
-        List[ElementId]([instance.Id])
-    )
+        symbol = symbols[symbol_names.index(selected_name)]
 
-    uidoc.ShowElements(instance.Id)
+        # 5. Ask the user to select the placement point
+        forms.alert(
+            "Family loaded successfully.\n\n"
+            "Click OK, then select a point in the Revit view."
+        )
 
-    TaskDialog.Show(
-        "Success",
-        "Family loaded and placed successfully!"
-    )
+        point = uidoc.Selection.PickPoint(
+            "Select the family placement point"
+        )
 
-except Exception as e:
-    TaskDialog.Show("Error", str(e))
+        # 6. Activate the type and place the family
+        with Transaction(doc, "Place Family") as t:
+            t.Start()
+
+            if not symbol.IsActive:
+                symbol.Activate()
+                doc.Regenerate()
+
+            instance = doc.Create.NewFamilyInstance(
+                point,
+                symbol,
+                StructuralType.NonStructural
+            )
+
+            t.Commit()
+
+        # 7. Select and zoom to the placed instance
+        selected_ids = List[ElementId]()
+        selected_ids.Add(instance.Id)
+
+        uidoc.Selection.SetElementIds(selected_ids)
+        uidoc.ShowElements(instance.Id)
+
+        forms.alert(
+            "Family placed successfully!\n\n"
+            "Family: {}\n"
+            "Type: {}".format(family.Name, symbol.Name),
+            title="Success"
+        )
+
+    except OperationCanceledException:
+        forms.alert("Placement cancelled.")
+
+    except Exception as e:
+        forms.alert(
+            "Error:\n{}".format(str(e)),
+            title="Family Loader"
+        )
+
+
+load_and_place_family()
+```
