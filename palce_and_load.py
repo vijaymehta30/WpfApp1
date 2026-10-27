@@ -6,9 +6,8 @@ from pyrevit import revit, forms
 from Autodesk.Revit.DB import (
     Transaction,
     Family,
-    FamilySymbol,
     FilteredElementCollector,
-    XYZ,
+    Level,
     ElementId
 )
 from Autodesk.Revit.DB.Structure import StructuralType
@@ -20,21 +19,19 @@ uidoc = revit.uidoc
 
 
 def load_and_place_family():
-    # 1. Choose a family file
     family_path = forms.pick_file(
         file_ext="rfa",
-        title="Select Family to Load and Place"
+        title="Select Furniture Family"
     )
 
     if not family_path:
         forms.alert("No family file selected.")
         return
 
-    family = None
-
     try:
-        # 2. Load the family or retrieve it if already loaded
+        # Load the family
         family_ref = clr.Reference[Family]()
+        family = None
 
         with Transaction(doc, "Load Family") as t:
             t.Start()
@@ -46,7 +43,7 @@ def load_and_place_family():
 
             t.Commit()
 
-        # If already loaded, retrieve it from the project
+        # Find the family if it was already loaded
         if family is None:
             expected_name = os.path.splitext(
                 os.path.basename(family_path)
@@ -58,26 +55,18 @@ def load_and_place_family():
                     break
 
         if family is None:
-            raise Exception(
-                "Could not load or find the selected family."
-            )
+            raise Exception("Could not load or find the family.")
 
-        # 3. Get the available family types
-        symbol_ids = list(family.GetFamilySymbolIds())
+        # Get available types
+        symbols = [
+            doc.GetElement(sid)
+            for sid in family.GetFamilySymbolIds()
+        ]
 
-        if not symbol_ids:
+        if not symbols:
             raise Exception("No family types found.")
 
-        symbols = [
-            doc.GetElement(symbol_id)
-            for symbol_id in symbol_ids
-        ]
-
-        # 4. Let the user choose a family type
-        symbol_names = [
-            "{}".format(symbol.Name)
-            for symbol in symbols
-        ]
+        symbol_names = [s.Name for s in symbols]
 
         selected_name = forms.SelectFromList.show(
             symbol_names,
@@ -86,22 +75,42 @@ def load_and_place_family():
         )
 
         if not selected_name:
-            forms.alert("No family type selected.")
             return
 
         symbol = symbols[symbol_names.index(selected_name)]
 
-        # 5. Ask the user to select the placement point
+        # Find a level
+        levels = list(
+            FilteredElementCollector(doc).OfClass(Level)
+        )
+
+        if not levels:
+            raise Exception("No levels found in the project.")
+
+        level_names = [level.Name for level in levels]
+
+        selected_level_name = forms.SelectFromList.show(
+            level_names,
+            title="Choose Placement Level",
+            button_name="Select Level"
+        )
+
+        if not selected_level_name:
+            return
+
+        level = levels[level_names.index(selected_level_name)]
+
+        # Pick a point in Revit
         forms.alert(
-            "Family loaded successfully.\n\n"
-            "Click OK, then select a point in the Revit view."
+            "Family is ready.\n"
+            "Click OK, then select a placement point."
         )
 
         point = uidoc.Selection.PickPoint(
-            "Select the family placement point"
+            "Select furniture placement point"
         )
 
-        # 6. Activate the type and place the family
+        # Activate and place
         with Transaction(doc, "Place Family") as t:
             t.Start()
 
@@ -112,12 +121,13 @@ def load_and_place_family():
             instance = doc.Create.NewFamilyInstance(
                 point,
                 symbol,
+                level,
                 StructuralType.NonStructural
             )
 
             t.Commit()
 
-        # 7. Select and zoom to the placed instance
+        # Select and zoom to the instance
         selected_ids = List[ElementId]()
         selected_ids.Add(instance.Id)
 
@@ -126,8 +136,11 @@ def load_and_place_family():
 
         forms.alert(
             "Family placed successfully!\n\n"
-            "Family: {}\n"
-            "Type: {}".format(family.Name, symbol.Name),
+            "Family: {}\nType: {}\nLevel: {}".format(
+                family.Name,
+                symbol.Name,
+                level.Name
+            ),
             title="Success"
         )
 
@@ -136,7 +149,7 @@ def load_and_place_family():
 
     except Exception as e:
         forms.alert(
-            "Error:\n{}".format(str(e)),
+            "Placement failed:\n{}".format(str(e)),
             title="Family Loader"
         )
 
