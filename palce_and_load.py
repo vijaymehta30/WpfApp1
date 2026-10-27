@@ -1,158 +1,196 @@
-```python
-import clr
+# -*- coding: utf-8 -*-
+"""Load a .rfa into the project and place it repeatedly (Esc to stop)."""
 import os
+import traceback
 
-from pyrevit import revit, forms
-from Autodesk.Revit.DB import (
-    Transaction,
-    Family,
-    FilteredElementCollector,
-    Level,
-    ElementId
-)
-from Autodesk.Revit.DB.Structure import StructuralType
+import clr
+from pyrevit import revit, DB, forms, script
 from Autodesk.Revit.Exceptions import OperationCanceledException
+from Autodesk.Revit.UI.Selection import ObjectSnapTypes
 from System.Collections.Generic import List
 
 doc = revit.doc
 uidoc = revit.uidoc
+logger = script.get_logger()
+
+PLAN_VIEW_TYPES = (DB.ViewType.FloorPlan, DB.ViewType.CeilingPlan,
+                   DB.ViewType.EngineeringPlan, DB.ViewType.AreaPlan)
 
 
-def load_and_place_family():
-    family_path = forms.pick_file(
-        file_ext="rfa",
-        title="Select Furniture Family"
-    )
+class WarningSwallower(DB.IFailuresPreprocessor):
+    """Dismiss warnings, print errors and let Revit roll back."""
+    def PreprocessFailures(self, accessor):
+        for f in accessor.GetFailureMessages():
+            if f.GetSeverity() == DB.FailureSeverity.Warning:
+                accessor.DeleteWarning(f)
+            else:
+                print("Revit error: {}".format(f.GetDescriptionText()))
+        return DB.FailureProcessingResult.Continue
 
-    if not family_path:
-        forms.alert("No family file selected.")
+
+class OverwriteLoadOptions(DB.IFamilyLoadOptions):
+    """Replace an existing family (and its parameter values) on load."""
+    def OnFamilyFound(self, familyInUse, overwriteParameterValues):
+        overwriteParameterValues.Value = True
+        return True
+
+    def OnSharedFamilyFound(self, sharedFamily, familyInUse, source,
+                            overwriteParameterValues):
+        source.Value = DB.FamilySource.Family
+        overwriteParameterValues.Value = True
+        return True
+
+
+def run_transaction(name, action):
+    """Run action() in one transaction; return True only if it committed."""
+    t = DB.Transaction(doc, name)
+    t.Start()
+    try:
+        opts = t.GetFailureHandlingOptions()
+        opts.SetFailuresPreprocessor(WarningSwallower())
+        t.SetFailureHandlingOptions(opts)
+        action()
+        status = t.Commit()
+    except Exception:
+        if t.HasStarted():
+            t.RollBack()
+        raise
+    if status != DB.TransactionStatus.Committed:
+        if t.HasStarted():
+            t.RollBack()
+        return False
+    return True
+
+
+def type_name(symbol):
+    p = symbol.get_Parameter(DB.BuiltInParameter.SYMBOL_NAME_PARAM)
+    return p.AsString() if p else str(symbol.Id)
+
+
+def load_family(path):
+    """Load (overwriting) and return the Family, or raise."""
+    box = clr.StrongBox[DB.Family]()
+    result = []
+
+    def action():
+        result.append(doc.LoadFamily(path, OverwriteLoadOptions(), box))
+
+    if not run_transaction("Load Family", action):
+        raise Exception("Loading the family was rolled back by Revit.")
+
+    family = box.Value
+    if family is None:
+        # Fall back to a lookup by file name
+        expected = os.path.splitext(os.path.basename(path))[0]
+        for item in DB.FilteredElementCollector(doc).OfClass(DB.Family):
+            if item.Name == expected:
+                family = item
+                break
+    if family is None:
+        raise Exception("Could not load or find the family.")
+    return family
+
+
+def pick_symbol(family):
+    symbols = [doc.GetElement(sid) for sid in family.GetFamilySymbolIds()]
+    symbols = [s for s in symbols if s is not None]
+    if not symbols:
+        raise Exception("The family has no types.")
+    by_name = dict((type_name(s), s) for s in symbols)
+    if len(by_name) == 1:
+        return symbols[0]
+    chosen = forms.SelectFromList.show(
+        sorted(by_name.keys()), title="Choose Family Type",
+        button_name="Select Type")
+    return by_name[chosen] if chosen else None
+
+
+def pick_level():
+    view = doc.ActiveView
+    if view.GenLevel is not None:
+        return view.GenLevel
+    levels = sorted(DB.FilteredElementCollector(doc).OfClass(DB.Level),
+                    key=lambda l: l.Elevation)
+    if not levels:
+        raise Exception("No levels found in the project.")
+    by_name = dict(("{} ({:.2f} ft)".format(l.Name, l.Elevation), l)
+                   for l in levels)
+    keys = [k for k, _ in sorted(by_name.items(),
+                                 key=lambda kv: kv[1].Elevation)]
+    chosen = forms.SelectFromList.show(
+        keys, title="Choose Placement Level", button_name="Select Level")
+    return by_name[chosen] if chosen else None
+
+
+def place_family():
+    # Preconditions
+    if doc.IsFamilyDocument:
+        forms.alert("Open a project, not a family document.")
+        return
+    if doc.ActiveView.ViewType not in PLAN_VIEW_TYPES:
+        forms.alert("Switch to a plan view first, then run again.")
         return
 
-    try:
-        # Load the family
-        family_ref = clr.Reference[Family]()
-        family = None
+    path = forms.pick_file(file_ext="rfa", title="Select Family")
+    if not path:
+        return
 
-        with Transaction(doc, "Load Family") as t:
-            t.Start()
-
-            loaded = doc.LoadFamily(family_path, family_ref)
-
-            if loaded:
-                family = family_ref.Value
-
-            t.Commit()
-
-        # Find the family if it was already loaded
-        if family is None:
-            expected_name = os.path.splitext(
-                os.path.basename(family_path)
-            )[0]
-
-            for item in FilteredElementCollector(doc).OfClass(Family):
-                if item.Name == expected_name:
-                    family = item
-                    break
-
-        if family is None:
-            raise Exception("Could not load or find the family.")
-
-        # Get available types
-        symbols = [
-            doc.GetElement(sid)
-            for sid in family.GetFamilySymbolIds()
-        ]
-
-        if not symbols:
-            raise Exception("No family types found.")
-
-        symbol_names = [s.Name for s in symbols]
-
-        selected_name = forms.SelectFromList.show(
-            symbol_names,
-            title="Choose Family Type",
-            button_name="Select Type"
-        )
-
-        if not selected_name:
-            return
-
-        symbol = symbols[symbol_names.index(selected_name)]
-
-        # Find a level
-        levels = list(
-            FilteredElementCollector(doc).OfClass(Level)
-        )
-
-        if not levels:
-            raise Exception("No levels found in the project.")
-
-        level_names = [level.Name for level in levels]
-
-        selected_level_name = forms.SelectFromList.show(
-            level_names,
-            title="Choose Placement Level",
-            button_name="Select Level"
-        )
-
-        if not selected_level_name:
-            return
-
-        level = levels[level_names.index(selected_level_name)]
-
-        # Pick a point in Revit
+    family = load_family(path)
+    if family.FamilyPlacementType != DB.FamilyPlacementType.OneLevelBased:
         forms.alert(
-            "Family is ready.\n"
-            "Click OK, then select a placement point."
-        )
+            "'{}' is {} and cannot be placed by this tool.\n"
+            "Only level-based families are supported.".format(
+                family.Name, family.FamilyPlacementType))
+        return
 
-        point = uidoc.Selection.PickPoint(
-            "Select furniture placement point"
-        )
+    symbol = pick_symbol(family)
+    if symbol is None:
+        return
+    level = pick_level()
+    if level is None:
+        return
 
-        # Activate and place
-        with Transaction(doc, "Place Family") as t:
-            t.Start()
+    if not symbol.IsActive:
+        def activate():
+            symbol.Activate()
+            doc.Regenerate()
 
-            if not symbol.IsActive:
-                symbol.Activate()
-                doc.Regenerate()
+        if not run_transaction("Activate Type", activate):
+            raise Exception("Activating the type was rolled back by Revit.")
 
-            instance = doc.Create.NewFamilyInstance(
-                point,
-                symbol,
-                level,
-                StructuralType.NonStructural
-            )
+    placed = []
+    while True:
+        try:
+            point = uidoc.Selection.PickPoint(
+                ObjectSnapTypes.Endpoints | ObjectSnapTypes.Midpoints
+                | ObjectSnapTypes.Intersections,
+                "Pick placement point for '{}' (Esc to finish)".format(
+                    type_name(symbol)))
+        except OperationCanceledException:
+            break
 
-            t.Commit()
+        created = []
 
-        # Select and zoom to the instance
-        selected_ids = List[ElementId]()
-        selected_ids.Add(instance.Id)
+        def action():
+            created.append(doc.Create.NewFamilyInstance(
+                point, symbol, level, DB.Structure.StructuralType.NonStructural))
 
-        uidoc.Selection.SetElementIds(selected_ids)
-        uidoc.ShowElements(instance.Id)
+        if not run_transaction("Place " + family.Name, action):
+            forms.alert("Placement was rolled back by Revit.")
+            break
+        placed.append(created[0].Id)
 
-        forms.alert(
-            "Family placed successfully!\n\n"
-            "Family: {}\nType: {}\nLevel: {}".format(
-                family.Name,
-                symbol.Name,
-                level.Name
-            ),
-            title="Success"
-        )
-
-    except OperationCanceledException:
-        forms.alert("Placement cancelled.")
-
-    except Exception as e:
-        forms.alert(
-            "Placement failed:\n{}".format(str(e)),
-            title="Family Loader"
-        )
+    if placed:
+        ids = List[DB.ElementId]()
+        for i in placed:
+            ids.Add(i)
+        uidoc.Selection.SetElementIds(ids)
+        print("Placed {} x '{}' ({}) on {}".format(
+            len(placed), family.Name, type_name(symbol), level.Name))
 
 
-load_and_place_family()
-```
+try:
+    place_family()
+except Exception as e:
+    logger.error(traceback.format_exc())
+    forms.alert("Placement failed:\n{}".format(e), title="Load and Place Family")
